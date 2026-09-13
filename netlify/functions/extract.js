@@ -1,16 +1,21 @@
 const https = require('https');
+const cheerio = require('cheerio');
 
-// URL에서 HTML을 가져오는 함수 (리다이렉트 자동 추적 포함)
+// HTTP/HTTPS 요청 함수 (리다이렉션 자동 처리)
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
     https.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       }
     }, (res) => {
-      // 리다이렉트(301, 302) 처리
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchHtml(res.headers.location).then(resolve).catch(reject);
+        let redirectUrl = res.headers.location;
+        if (!redirectUrl.startsWith('http')) {
+          redirectUrl = 'https://m.blog.naver.com' + redirectUrl;
+        }
+        return fetchHtml(redirectUrl).then(resolve).catch(reject);
       }
 
       let data = '';
@@ -18,65 +23,6 @@ function fetchHtml(url) {
       res.on('end', () => resolve(data));
     }).on('error', err => reject(err));
   });
-}
-
-// HTML 태그 제거 및 본문 텍스트 추출 함수
-function parseBlogContent(html) {
-  let mainContent = html;
-
-  // 1. 블로그 제목 추출 시도
-  let title = 'blog_content';
-  const titleMatch = html.match(/<meta[^>]*property="og:title"[^>]*content="([^"]*)"/i) || 
-                     html.match(/<title>([\s\S]*?)<\/title>/i);
-  if (titleMatch && titleMatch[1]) {
-    title = titleMatch[1].replace(/[\\/:*?"<>|]/g, '').trim(); // 파일명으로 쓸 수 없는 특수문자 제거
-  }
-
-  // 2. 모바일/스마트에디터 본문 컨테이너 추출
-  const containerMatches = [
-    html.match(/<div[^>]*class="[^"]*se-main-container[^"]*"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<\/div>/i),
-    html.match(/<div[^>]*id="post-view-zone"[^>]*>([\s\S]*?)<\/div>/i),
-    html.match(/<div[^>]*class="[^"]*post_area[^"]*"[^>]*>([\s\S]*?)<\/div>/i)
-  ];
-
-  for (const match of containerMatches) {
-    if (match && match[1]) {
-      mainContent = match[1];
-      break;
-    }
-  }
-
-  // 3. 스크립트, 스타일 태그 완전히 제거
-  mainContent = mainContent.replace(/<script[\s\S]*?<\/script>/gi, '')
-                           .replace(/<style[\s\S]*?<\/style>/gi, '')
-                           .replace(/<!--[\s\S]*?-->/g, '');
-
-  // 4. 단락 구분 및 줄바꿈 태그 처리
-  mainContent = mainContent.replace(/<\/p>/gi, '\n')
-                           .replace(/<\/div>/gi, '\n')
-                           .replace(/<br\s*[\/]?>/gi, '\n')
-                           .replace(/<\/li>/gi, '\n');
-
-  // 5. HTML 태그 제거
-  let cleanText = mainContent.replace(/<[^>]+>/g, '');
-
-  // 6. HTML 엔티티 디코딩
-  cleanText = cleanText.replace(/&nbsp;/gi, ' ')
-                       .replace(/&lt;/gi, '<')
-                       .replace(/&gt;/gi, '>')
-                       .replace(/&amp;/gi, '&')
-                       .replace(/&quot;/gi, '"')
-                       .replace(/&#39;/gi, "'");
-
-  // 7. 다중 공백 및 빈 줄 정돈
-  const lines = cleanText.split('\n')
-                         .map(line => line.trim())
-                         .filter(line => line.length > 0);
-
-  return {
-    title: title,
-    content: lines.join('\n')
-  };
 }
 
 exports.handler = async (event, context) => {
@@ -93,19 +39,63 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // 네이버 블로그 URL을 모바일 URL 구조로 변환
+    // 모바일 URL 구조로 전환
     let targetUrl = url;
     if (url.includes('blog.naver.com') && !url.includes('m.blog.naver.com')) {
       targetUrl = url.replace('blog.naver.com', 'm.blog.naver.com');
     }
 
     const html = await fetchHtml(targetUrl);
-    const result = parseBlogContent(html);
+    const $ = cheerio.load(html);
 
-    if (!result.content || result.content.length === 0) {
+    // 1. 제목 추출 (og:title 또는 .se-title-text)
+    let title = $('meta[property="og:title"]').attr('content') || $('.se-title-text').text() || $('title').text();
+    title = title.replace(/[\\/:*?"<>|]/g, '').trim();
+
+    // 2. 본문 텍스트 추출
+    // 스마트에디터 ONE (.se-main-container / .se-component-text 등) 및 구버전 에디터 대응
+    let textPieces = [];
+
+    // 최신 스마트에디터 ONE 본문 요소들 선택
+    const textSelectors = [
+      '.se-component-text',
+      '.se-text-paragraph',
+      '.se-module-text',
+      '.post_area',
+      '#post-view-zone'
+    ];
+
+    textSelectors.forEach(selector => {
+      $(selector).each((_, el) => {
+        const text = $(el).text().trim();
+        if (text) {
+          textPieces.push(text);
+        }
+      });
+    });
+
+    // 만약 위의 특정 클래스로 안 잡힐 경우 전체 se-main-container 내부 텍스트 수집
+    if (textPieces.length === 0) {
+      $('.se-main-container p, .se-main-container span').each((_, el) => {
+        const text = $(el).text().trim();
+        if (text && !textPieces.includes(text)) {
+          textPieces.push(text);
+        }
+      });
+    }
+
+    // 최종 본문 조합 (중복 및 빈 줄 제거)
+    const content = textPieces
+      .join('\n')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .join('\n');
+
+    if (!content || content.length === 0) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ message: '본문 텍스트를 추출하지 못했습니다. URL을 확인해 주세요.' })
+        body: JSON.stringify({ message: '본문 텍스트를 추출하지 못했습니다. 링크가 비공개이거나 스마트에디터 형식이 아닐 수 있습니다.' })
       };
     }
 
@@ -113,10 +103,11 @@ exports.handler = async (event, context) => {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        title: result.title,
-        content: result.content
+        title: title || 'blog_content',
+        content: content
       })
     };
+
   } catch (error) {
     return {
       statusCode: 500,
