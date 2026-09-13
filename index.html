@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>네이버 블로그 텍스트 다운로더</title>
+  <title>네이버 블로그 텍스트 다중 다운로더</title>
   <style>
     * {
       box-sizing: border-box;
@@ -25,7 +25,7 @@
       border-radius: 12px;
       box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
       width: 100%;
-      max-width: 500px;
+      max-width: 550px;
     }
     h1 {
       font-size: 22px;
@@ -44,19 +44,27 @@
       color: #333;
       font-weight: bold;
     }
-    input[type="url"] {
+    textarea {
       padding: 12px;
       border: 1px solid #ddd;
       border-radius: 6px;
-      font-size: 14px;
+      font-size: 13px;
       outline: none;
-      transition: border-color 0.2s;
+      height: 150px;
+      resize: vertical;
+      line-height: 1.5;
+      font-family: monospace;
     }
-    input[type="url"]:focus {
+    textarea:focus {
       border-color: #19ce60;
     }
+    .hint {
+      font-size: 12px;
+      color: #888;
+      margin-top: -6px;
+    }
     button {
-      padding: 12px;
+      padding: 14px;
       background-color: #19ce60;
       color: white;
       border: none;
@@ -90,17 +98,16 @@
 <body>
 
   <div class="container">
-    <h1>네이버 블로그 텍스트 추출기</h1>
+    <h1>네이버 블로그 텍스트 다중 추출기</h1>
     
     <div class="input-group">
-      <label for="blog-url">네이버 블로그 주소 (URL)</label>
-      <input 
-        type="url" 
-        id="blog-url" 
-        placeholder="https://blog.naver.com/..." 
-        required 
-      />
-      <button id="download-btn" onclick="handleDownload()">텍스트 다운로드</button>
+      <label for="blog-urls">네이버 블로그 주소 목록 (줄바꿈으로 구분)</label>
+      <textarea 
+        id="blog-urls" 
+        placeholder="https://blog.naver.com/example1&#10;https://blog.naver.com/example2&#10;https://blog.naver.com/example3"
+      ></textarea>
+      <div class="hint">* 여러 주소를 입력 시 각 글을 txt 파일로 만들어 ZIP으로 압축해 다운로드한다. (최대 20개)</div>
+      <button id="download-btn" onclick="handleDownload()">ZIP 파일로 일괄 다운로드</button>
     </div>
 
     <div id="status"></div>
@@ -108,17 +115,27 @@
 
   <script>
     async function handleDownload() {
-      const urlInput = document.getElementById('blog-url');
+      const urlsInput = document.getElementById('blog-urls');
       const statusDiv = document.getElementById('status');
       const downloadBtn = document.getElementById('download-btn');
-      const blogUrl = urlInput.value.trim();
-
-      if (!blogUrl) {
-        setStatus('URL을 입력해주세요.', 'error');
+      
+      const rawText = urlsInput.value.trim();
+      if (!rawText) {
+        setStatus('URL을 하나 이상 입력해 주세요.', 'error');
         return;
       }
 
-      setStatus('텍스트를 추출하는 중입니다...', '');
+      // 줄바꿈 단위로 URL 분리 및 정제
+      const urls = rawText.split('\n')
+                          .map(url => url.trim())
+                          .filter(url => url.startsWith('http'));
+
+      if (urls.length === 0) {
+        setStatus('올바른 URL 형식(http:// 또는 https://)을 입력해 주세요.', 'error');
+        return;
+      }
+
+      setStatus(`${urls.length}개의 블로그 텍스트를 수집 및 압축하는 중입니다...`, '');
       downloadBtn.disabled = true;
 
       try {
@@ -127,7 +144,7 @@
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ url: blogUrl }),
+          body: JSON.stringify({ urls: urls }),
         });
 
         if (!response.ok) {
@@ -136,10 +153,10 @@
         }
 
         const data = await response.json();
-        const filename = `${data.title || 'blog_content'}.txt`;
         
-        downloadTxtFile(filename, data.content);
-        setStatus('다운로드가 완료되었습니다.', 'success');
+        // Base64 문자열을 Blob 바이너리로 변환 후 ZIP 다운로드
+        downloadZipFile(`naver_blogs_${Date.now()}.zip`, data.zipData);
+        setStatus(`총 ${data.count}개 블로그 글의 다운로드가 완료되었습니다.`, 'success');
 
       } catch (error) {
         setStatus(error.message, 'error');
@@ -148,8 +165,16 @@
       }
     }
 
-    function downloadTxtFile(filename, text) {
-      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    // Base64 ZIP 데이터를 받아 파일 다운로드 트리거
+    function downloadZipFile(filename, base64Data) {
+      const byteCharacters = atob(base64Data);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: 'application/zip' });
+
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
       link.download = filename;
