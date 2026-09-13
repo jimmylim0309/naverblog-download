@@ -1,7 +1,8 @@
 const https = require('https');
 const cheerio = require('cheerio');
+const JSZip = require('jszip');
 
-// HTTP/HTTPS 요청 함수 (리다이렉션 자동 처리)
+// HTTP/HTTPS 요청 함수 (리다이렉션 처리 포함)
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
     https.get(url, {
@@ -25,38 +26,26 @@ function fetchHtml(url) {
   });
 }
 
-exports.handler = async (event, context) => {
-  if (event.httpMethod !== 'POST') {
-    return { statusCode: 405, body: 'Method Not Allowed' };
-  }
-
+// 블로그 단일 개체 파싱 함수
+async function parseSingleBlog(url, index) {
   try {
-    const { url } = JSON.parse(event.body || '{}');
-    if (!url) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ message: 'URL이 필요합니다.' })
-      };
-    }
+    let targetUrl = url.trim();
+    if (!targetUrl) return null;
 
-    // 모바일 URL 구조로 전환
-    let targetUrl = url;
-    if (url.includes('blog.naver.com') && !url.includes('m.blog.naver.com')) {
-      targetUrl = url.replace('blog.naver.com', 'm.blog.naver.com');
+    if (targetUrl.includes('blog.naver.com') && !targetUrl.includes('m.blog.naver.com')) {
+      targetUrl = targetUrl.replace('blog.naver.com', 'm.blog.naver.com');
     }
 
     const html = await fetchHtml(targetUrl);
     const $ = cheerio.load(html);
 
-    // 1. 제목 추출 (og:title 또는 .se-title-text)
+    // 제목 추출
     let title = $('meta[property="og:title"]').attr('content') || $('.se-title-text').text() || $('title').text();
     title = title.replace(/[\\/:*?"<>|]/g, '').trim();
+    if (!title) title = `blog_content_${index + 1}`;
 
-    // 2. 본문 텍스트 추출
-    // 스마트에디터 ONE (.se-main-container / .se-component-text 등) 및 구버전 에디터 대응
+    // 본문 추출
     let textPieces = [];
-
-    // 최신 스마트에디터 ONE 본문 요소들 선택
     const textSelectors = [
       '.se-component-text',
       '.se-text-paragraph',
@@ -68,23 +57,17 @@ exports.handler = async (event, context) => {
     textSelectors.forEach(selector => {
       $(selector).each((_, el) => {
         const text = $(el).text().trim();
-        if (text) {
-          textPieces.push(text);
-        }
+        if (text) textPieces.push(text);
       });
     });
 
-    // 만약 위의 특정 클래스로 안 잡힐 경우 전체 se-main-container 내부 텍스트 수집
     if (textPieces.length === 0) {
       $('.se-main-container p, .se-main-container span').each((_, el) => {
         const text = $(el).text().trim();
-        if (text && !textPieces.includes(text)) {
-          textPieces.push(text);
-        }
+        if (text && !textPieces.includes(text)) textPieces.push(text);
       });
     }
 
-    // 최종 본문 조합 (중복 및 빈 줄 제거)
     const content = textPieces
       .join('\n')
       .split('\n')
@@ -92,19 +75,66 @@ exports.handler = async (event, context) => {
       .filter(line => line.length > 0)
       .join('\n');
 
-    if (!content || content.length === 0) {
+    if (!content) return null;
+
+    return { title, content };
+  } catch (error) {
+    console.error(`Error parsing ${url}:`, error);
+    return null;
+  }
+}
+
+exports.handler = async (event, context) => {
+  if (event.httpMethod !== 'POST') {
+    return { statusCode: 405, body: 'Method Not Allowed' };
+  }
+
+  try {
+    const { urls } = JSON.parse(event.body || '{}');
+
+    if (!urls || !Array.isArray(urls) || urls.length === 0) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ message: '본문 텍스트를 추출하지 못했습니다. 링크가 비공개이거나 스마트에디터 형식이 아닐 수 있습니다.' })
+        body: JSON.stringify({ message: '하나 이상의 올바른 URL을 입력해야 합니다.' })
       };
     }
+
+    // 최대 20개 URL 제한 (서버리스 함수 타임아웃 방지)
+    const targetUrls = urls.slice(0, 20);
+    const results = await Promise.all(targetUrls.map((url, idx) => parseSingleBlog(url, idx)));
+    const validResults = results.filter(item => item !== null);
+
+    if (validResults.length === 0) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ message: '입력한 URL에서 본문 텍스트를 추출하지 못했습니다.' })
+      };
+    }
+
+    // JSZip 객체 생성 및 파일 추가
+    const zip = new JSZip();
+    const usedTitles = new Set();
+
+    validResults.forEach((item, idx) => {
+      let fileName = item.title;
+      // 파일명 중복 처리
+      if (usedTitles.has(fileName)) {
+        fileName = `${fileName}_${idx + 1}`;
+      }
+      usedTitles.add(fileName);
+
+      zip.file(`${fileName}.txt`, item.content);
+    });
+
+    // ZIP 파일 생성 (Base64 인코딩)
+    const zipBase64 = await zip.generateAsync({ type: 'base64' });
 
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        title: title || 'blog_content',
-        content: content
+        zipData: zipBase64,
+        count: validResults.length
       })
     };
 
