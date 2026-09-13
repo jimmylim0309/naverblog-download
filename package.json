@@ -1,0 +1,9 @@
+{
+  "name": "naver-blog-downloader",
+  "version": "1.0.0",
+  "description": "Naver Blog Text Extractor",
+  "main": "index.js",
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
